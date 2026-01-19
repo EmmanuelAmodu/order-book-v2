@@ -1,0 +1,233 @@
+use std::collections::{BTreeMap, VecDeque, HashMap};
+
+const TICK_SIZE: f64 = 0.000001;
+
+type OrderId = u64;
+type PriceTick = u32; // integer ticks
+type Qty = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side { Bid, Ask }
+
+#[derive(Debug, Clone, Copy)]
+struct Order {
+    id: OrderId,
+    price: PriceTick,
+    qty_remaining: Qty,
+    side: Side,
+    live: bool, // tombstone cancel
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoneReason { Filled, Canceled, Rejected }
+
+#[derive(Debug, Clone, Copy)]
+struct TradeEvent {
+    taker_id: OrderId,
+    maker_id: OrderId,
+    price: PriceTick,
+    qty: Qty,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoneEvent { order_id: OrderId, reason: DoneReason }
+
+#[derive(Debug, Clone, Copy)]
+struct AckEvent { order_id: OrderId }
+
+#[derive(Debug, Clone, Copy)]
+enum Event {
+    Trade(TradeEvent),
+    Done(DoneEvent),
+    Ack(AckEvent),
+}
+
+pub(crate) struct OrderBook {
+    bids: BTreeMap<PriceTick, VecDeque<OrderId>>,
+    asks: BTreeMap<PriceTick, VecDeque<OrderId>>,
+    orders: HashMap<OrderId, Order>,
+}
+
+impl OrderBook {
+    pub fn new() -> Self {
+        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), orders: HashMap::new() }
+    }
+
+    #[inline]
+    fn best_bid_price(&self) -> Option<PriceTick> {
+        self.bids.last_key_value().map(|(p, _)| *p)
+    }
+
+    #[inline]
+    fn best_ask_price(&self) -> Option<PriceTick> {
+        self.asks.first_key_value().map(|(p, _)| *p)
+    }
+
+    // Minimal validation (crossing is OK)
+    fn validate_order(&self, o: &Order) -> Result<(), DoneReason> {
+        if o.qty_remaining == 0 { return Err(DoneReason::Rejected); }
+        // price bounds checks happen before conversion to ticks in a real system
+        Ok(())
+    }
+
+    pub fn cancel(&mut self, id: OrderId) -> Vec<Event> {
+        let mut ev = Vec::new();
+        if let Some(o) = self.orders.get_mut(&id) {
+            if o.live && o.qty_remaining > 0 {
+                o.live = false;
+                ev.push(Event::Done(DoneEvent { order_id: id, reason: DoneReason::Canceled }));
+            }
+        }
+        ev
+    }
+
+    pub fn place_limit(&mut self, mut order: Order) -> Vec<Event> {
+        let mut events = Vec::new();
+
+        if self.validate_order(&order).is_err() {
+            events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
+            return events;
+        }
+
+        // Insert into global store early so maker/taker updates are easy
+        self.orders.insert(order.id, order);
+
+        // Match as taker
+        events.extend(self.match_order(order.id));
+
+        // If still live with remaining qty, rest it
+        let rest_qty = self.orders.get(&order.id).map(|o| (o.live, o.qty_remaining, o.price, o.side));
+        if let Some((live, qty_remaining, price, side)) = rest_qty {
+            if live && qty_remaining > 0 {
+                let book = match side { Side::Bid => &mut self.bids, Side::Ask => &mut self.asks };
+                book.entry(price).or_insert_with(VecDeque::new).push_back(order.id);
+            } else {
+                // fully filled inside match_order likely emitted Done(Filled)
+            }
+        }
+
+        events.push(Event::Ack(AckEvent { order_id: order.id }));
+        events
+    }
+
+    fn match_order(&mut self, taker_id: OrderId) -> Vec<Event> {
+        let mut events = Vec::new();
+
+        loop {
+            // Pull taker snapshot (avoid long borrows)
+            let (taker_side, taker_price, taker_live, taker_qty) = match self.orders.get(&taker_id) {
+                Some(o) => (o.side, o.price, o.live, o.qty_remaining),
+                None => break,
+            };
+            if !taker_live || taker_qty == 0 { break; }
+
+            // Determine best opposing price and whether it crosses
+            let best_opp = match taker_side {
+                Side::Bid => self.best_ask_price(),
+                Side::Ask => self.best_bid_price(),
+            };
+            let opp_price = match best_opp {
+                Some(p) => p,
+                None => break,
+            };
+
+            let crosses = match taker_side {
+                Side::Bid => opp_price <= taker_price,
+                Side::Ask => opp_price >= taker_price,
+            };
+            if !crosses { break; }
+
+            // Pop a maker id from the opposing best level (skip dead via tombstones)
+            let maker_id_opt = {
+                let opp_book = match taker_side { Side::Bid => &mut self.asks, Side::Ask => &mut self.bids };
+                let level = match opp_book.get_mut(&opp_price) {
+                    Some(l) => l,
+                    None => continue,
+                };
+
+                // Clean dead makers at the front
+                while let Some(mid) = level.front().copied() {
+                    let live = self.orders.get(&mid).map(|o| o.live && o.qty_remaining > 0).unwrap_or(false);
+                    if live { break; }
+                    level.pop_front();
+                }
+
+                let mid = level.pop_front();
+
+                // Remove empty level
+                if level.is_empty() {
+                    // cannot use opp_book here because `level` borrow is active, so do it after scope
+                }
+
+                mid
+            };
+
+            // Remove empty level (do it in a separate short borrow)
+            {
+                let opp_book = match taker_side { Side::Bid => &mut self.asks, Side::Ask => &mut self.bids };
+                if let Some(level) = opp_book.get(&opp_price) {
+                    if level.is_empty() {
+                        opp_book.remove(&opp_price);
+                    }
+                }
+            }
+
+            let maker_id = match maker_id_opt {
+                Some(m) => m,
+                None => continue, // level was empty or all dead
+            };
+
+            // Now do the actual fill
+            let (maker_price, fill_qty) = {
+                let taker = self.orders.get(&taker_id).unwrap();
+                let maker = self.orders.get(&maker_id).unwrap();
+                let qty = taker.qty_remaining.min(maker.qty_remaining);
+                (maker.price, qty)
+            };
+
+            // Apply updates
+            {
+                // Update taker
+                let taker_done = {
+                    let taker = self.orders.get_mut(&taker_id).unwrap();
+                    taker.qty_remaining -= fill_qty;
+                    if taker.qty_remaining == 0 {
+                        taker.live = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                // Update maker
+                let maker_done = {
+                    let maker = self.orders.get_mut(&maker_id).unwrap();
+                    maker.qty_remaining -= fill_qty;
+                    if maker.qty_remaining == 0 {
+                        maker.live = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                events.push(Event::Trade(TradeEvent {
+                    taker_id,
+                    maker_id,
+                    price: maker_price, // resting price
+                    qty: fill_qty,
+                }));
+
+                if maker_done {
+                    events.push(Event::Done(DoneEvent { order_id: maker_id, reason: DoneReason::Filled }));
+                }
+                if taker_done {
+                    events.push(Event::Done(DoneEvent { order_id: taker_id, reason: DoneReason::Filled }));
+                    break;
+                }
+            }
+        }
+
+        events
+    }
+}
