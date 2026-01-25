@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, VecDeque, HashMap};
 
-const TICK_SIZE: f64 = 0.000001;
+pub const TICK_SIZE: f64 = 0.000001;
 
-type OrderId = u64;
-type PriceTick = u32; // integer ticks
-type Qty = u64;
+pub type OrderId = u64;
+pub type PriceTick = u32; // integer ticks
+pub type Qty = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side { Bid, Ask }
+pub enum Side { Bid, Ask }
 
 #[derive(Debug, Clone, Copy)]
-struct Order {
+pub struct Order {
     id: OrderId,
     price: PriceTick,
     qty_remaining: Qty,
@@ -18,31 +18,57 @@ struct Order {
     live: bool, // tombstone cancel
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DoneReason { Filled, Canceled, Rejected }
+impl Order {
+    pub fn new(id: OrderId, side: Side, price: PriceTick, qty: Qty) -> Self {
+        Self { id, side, price, qty_remaining: qty, live: true }
+    }
+
+    pub fn id(&self) -> OrderId {
+        self.id
+    }
+
+    pub fn side(&self) -> Side {
+        self.side
+    }
+
+    pub fn price(&self) -> PriceTick {
+        self.price
+    }
+
+    pub fn qty_remaining(&self) -> Qty {
+        self.qty_remaining
+    }
+
+    pub fn live(&self) -> bool {
+        self.live
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneReason { Filled, Canceled, Rejected }
 
 #[derive(Debug, Clone, Copy)]
-struct TradeEvent {
-    taker_id: OrderId,
-    maker_id: OrderId,
-    price: PriceTick,
-    qty: Qty,
+pub struct TradeEvent {
+    pub taker_id: OrderId,
+    pub maker_id: OrderId,
+    pub price: PriceTick,
+    pub qty: Qty,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DoneEvent { order_id: OrderId, reason: DoneReason }
+pub struct DoneEvent { pub order_id: OrderId, pub reason: DoneReason }
 
 #[derive(Debug, Clone, Copy)]
-struct AckEvent { order_id: OrderId }
+pub struct AckEvent { pub order_id: OrderId }
 
 #[derive(Debug, Clone, Copy)]
-enum Event {
+pub enum Event {
     Trade(TradeEvent),
     Done(DoneEvent),
     Ack(AckEvent),
 }
 
-pub(crate) struct OrderBook {
+pub struct OrderBook {
     bids: BTreeMap<PriceTick, VecDeque<OrderId>>,
     asks: BTreeMap<PriceTick, VecDeque<OrderId>>,
     orders: HashMap<OrderId, Order>,
@@ -54,17 +80,39 @@ impl OrderBook {
     }
 
     #[inline]
-    fn best_bid_price(&self) -> Option<PriceTick> {
+    pub fn best_bid_price(&self) -> Option<PriceTick> {
         self.bids.last_key_value().map(|(p, _)| *p)
     }
 
     #[inline]
-    fn best_ask_price(&self) -> Option<PriceTick> {
+    pub fn best_ask_price(&self) -> Option<PriceTick> {
         self.asks.first_key_value().map(|(p, _)| *p)
+    }
+
+    pub fn order(&self, id: OrderId) -> Option<Order> {
+        self.orders.get(&id).copied()
+    }
+
+    pub fn level_front(&self, side: Side, price: PriceTick) -> Option<OrderId> {
+        let book = match side { Side::Bid => &self.bids, Side::Ask => &self.asks };
+        book.get(&price).and_then(|level| level.front().copied())
+    }
+
+    pub fn level_exists(&self, side: Side, price: PriceTick) -> bool {
+        let book = match side { Side::Bid => &self.bids, Side::Ask => &self.asks };
+        book.get(&price).map(|level| !level.is_empty()).unwrap_or(false)
+    }
+
+    pub fn book_is_empty(&self, side: Side) -> bool {
+        match side {
+            Side::Bid => self.bids.is_empty(),
+            Side::Ask => self.asks.is_empty(),
+        }
     }
 
     // Minimal validation (crossing is OK)
     fn validate_order(&self, o: &Order) -> Result<(), DoneReason> {
+        if !o.live { return Err(DoneReason::Rejected); }
         if o.qty_remaining == 0 { return Err(DoneReason::Rejected); }
         // price bounds checks happen before conversion to ticks in a real system
         Ok(())
@@ -81,8 +129,13 @@ impl OrderBook {
         ev
     }
 
-    pub fn place_limit(&mut self, mut order: Order) -> Vec<Event> {
+    pub fn place_limit(&mut self, order: Order) -> Vec<Event> {
         let mut events = Vec::new();
+
+        if self.orders.contains_key(&order.id) {
+            events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
+            return events;
+        }
 
         if self.validate_order(&order).is_err() {
             events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
@@ -137,7 +190,7 @@ impl OrderBook {
             };
             if !crosses { break; }
 
-            // Pop a maker id from the opposing best level (skip dead via tombstones)
+            // Peek a maker id from the opposing best level (skip dead via tombstones)
             let maker_id_opt = {
                 let opp_book = match taker_side { Side::Bid => &mut self.asks, Side::Ask => &mut self.bids };
                 let level = match opp_book.get_mut(&opp_price) {
@@ -152,30 +205,21 @@ impl OrderBook {
                     level.pop_front();
                 }
 
-                let mid = level.pop_front();
-
-                // Remove empty level
-                if level.is_empty() {
-                    // cannot use opp_book here because `level` borrow is active, so do it after scope
-                }
-
-                mid
+                level.front().copied()
             };
 
             // Remove empty level (do it in a separate short borrow)
-            {
+            if maker_id_opt.is_none() {
                 let opp_book = match taker_side { Side::Bid => &mut self.asks, Side::Ask => &mut self.bids };
                 if let Some(level) = opp_book.get(&opp_price) {
                     if level.is_empty() {
                         opp_book.remove(&opp_price);
                     }
                 }
+                continue; // level was empty or all dead
             }
 
-            let maker_id = match maker_id_opt {
-                Some(m) => m,
-                None => continue, // level was empty or all dead
-            };
+            let maker_id = maker_id_opt.unwrap();
 
             // Now do the actual fill
             let (maker_price, fill_qty) = {
@@ -186,7 +230,7 @@ impl OrderBook {
             };
 
             // Apply updates
-            {
+            let (taker_done, maker_done) = {
                 // Update taker
                 let taker_done = {
                     let taker = self.orders.get_mut(&taker_id).unwrap();
@@ -211,20 +255,31 @@ impl OrderBook {
                     }
                 };
 
-                events.push(Event::Trade(TradeEvent {
-                    taker_id,
-                    maker_id,
-                    price: maker_price, // resting price
-                    qty: fill_qty,
-                }));
+                (taker_done, maker_done)
+            };
 
-                if maker_done {
-                    events.push(Event::Done(DoneEvent { order_id: maker_id, reason: DoneReason::Filled }));
+            events.push(Event::Trade(TradeEvent {
+                taker_id,
+                maker_id,
+                price: maker_price, // resting price
+                qty: fill_qty,
+            }));
+
+            if maker_done {
+                events.push(Event::Done(DoneEvent { order_id: maker_id, reason: DoneReason::Filled }));
+                let opp_book = match taker_side { Side::Bid => &mut self.asks, Side::Ask => &mut self.bids };
+                if let Some(level) = opp_book.get_mut(&opp_price) {
+                    if level.front().copied() == Some(maker_id) {
+                        level.pop_front();
+                    }
+                    if level.is_empty() {
+                        opp_book.remove(&opp_price);
+                    }
                 }
-                if taker_done {
-                    events.push(Event::Done(DoneEvent { order_id: taker_id, reason: DoneReason::Filled }));
-                    break;
-                }
+            }
+            if taker_done {
+                events.push(Event::Done(DoneEvent { order_id: taker_id, reason: DoneReason::Filled }));
+                break;
             }
         }
 
