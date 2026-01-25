@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use hello_rust::order_book::*;
+    use hello_rust::engine::order_book::*;
 
     fn o(id: OrderId, side: Side, price: PriceTick, qty: Qty) -> Order {
         Order::new(id, side, price, qty)

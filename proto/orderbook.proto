@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package orderbook;
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BID = 1;
+  SIDE_ASK = 2;
+}
+
+message PlaceLimit {
+  uint64 id = 1;
+  Side side = 2;
+  uint32 price = 3;
+  uint64 qty = 4;
+  string market_id = 5;
+}
+
+message Cancel {
+  uint64 id = 1;
+  string market_id = 2;
+}
+
+message OrderCommand {
+  oneof cmd {
+    PlaceLimit place_limit = 1;
+    Cancel cancel = 2;
+  }
+}
+
+enum DoneReason {
+  DONE_REASON_UNSPECIFIED = 0;
+  DONE_REASON_FILLED = 1;
+  DONE_REASON_CANCELED = 2;
+  DONE_REASON_REJECTED = 3;
+}
+
+message TradeEvent {
+  uint64 taker_id = 1;
+  uint64 maker_id = 2;
+  uint32 price = 3;
+  uint64 qty = 4;
+}
+
+message DoneEvent {
+  uint64 order_id = 1;
+  DoneReason reason = 2;
+}
+
+message AckEvent {
+  uint64 order_id = 1;
+}
+
+message Event {
+  oneof kind {
+    TradeEvent trade = 1;
+    DoneEvent done = 2;
+    AckEvent ack = 3;
+  }
+}
