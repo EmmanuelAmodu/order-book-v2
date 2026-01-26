@@ -80,18 +80,37 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         DeliverPolicy::All
     };
 
-    let consumer = stream
-        .create_consumer(jetstream::consumer::push::Config {
-            name: Some(format!("{}-{}", consumer_name, state.last_sequence)),
-            durable_name: None,
-            deliver_subject,
-            deliver_policy,
-            ack_policy: AckPolicy::Explicit,
-            filter_subject: orders_subject.clone(),
-            ack_wait: Duration::from_secs(30),
-            ..Default::default()
-        })
-        .await?;
+    // Keep a durable consumer when snapshots are disabled so restarts don't replay the stream.
+    let use_durable = snapshot_bucket.is_none();
+    let consumer = if use_durable {
+        stream
+            .get_or_create_consumer(
+                &consumer_name,
+                jetstream::consumer::push::Config {
+                    durable_name: Some(consumer_name.clone()),
+                    deliver_subject: deliver_subject.clone(),
+                    deliver_policy: deliver_policy.clone(),
+                    ack_policy: AckPolicy::Explicit,
+                    filter_subject: orders_subject.clone(),
+                    ack_wait: Duration::from_secs(30),
+                    ..Default::default()
+                },
+            )
+            .await?
+    } else {
+        stream
+            .create_consumer(jetstream::consumer::push::Config {
+                name: Some(format!("{}-{}", consumer_name, state.last_sequence)),
+                durable_name: None,
+                deliver_subject,
+                deliver_policy,
+                ack_policy: AckPolicy::Explicit,
+                filter_subject: orders_subject.clone(),
+                ack_wait: Duration::from_secs(30),
+                ..Default::default()
+            })
+            .await?
+    };
 
     let mut messages = consumer.messages().await?;
     let mut shutdown = Box::pin(shutdown_signal());
