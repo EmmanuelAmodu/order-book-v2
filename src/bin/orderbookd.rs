@@ -9,7 +9,7 @@ use async_nats::jetstream;
 use async_nats::jetstream::consumer::AckPolicy;
 
 use hello_rust::markets::Markets;
-use hello_rust::engine::order_book::{DoneReason, Event, Order, Side};
+use hello_rust::engine::order_book::{DoneEvent, DoneReason, Event, Order, Side};
 use hello_rust::proto::orderbook as pb;
 
 #[tokio::main]
@@ -93,10 +93,18 @@ fn apply_command(markets: &mut Markets, command: pb::OrderCommand) -> Result<Vec
             let side = match pb::Side::try_from(place.side) {
                 Ok(pb::Side::Bid) => Side::Bid,
                 Ok(pb::Side::Ask) => Side::Ask,
-                Ok(pb::Side::Unspecified) | Err(_) => return Err("invalid side".to_string()),
+                Ok(pb::Side::Unspecified) | Err(_) => {
+                    return Ok(vec![Event::Done(DoneEvent {
+                        order_id: place.id,
+                        reason: DoneReason::Rejected,
+                    })]);
+                }
             };
             if place.market_id.is_empty() {
-                return Err("missing market_id".to_string());
+                return Ok(vec![Event::Done(DoneEvent {
+                    order_id: place.id,
+                    reason: DoneReason::Rejected,
+                })]);
             }
             Ok(markets
                 .book_mut(&place.market_id)
@@ -104,7 +112,10 @@ fn apply_command(markets: &mut Markets, command: pb::OrderCommand) -> Result<Vec
         }
         Some(pb::order_command::Cmd::Cancel(cancel)) => {
             if cancel.market_id.is_empty() {
-                return Err("missing market_id".to_string());
+                return Ok(vec![Event::Done(DoneEvent {
+                    order_id: cancel.id,
+                    reason: DoneReason::Rejected,
+                })]);
             }
             Ok(markets.book_mut(&cancel.market_id).cancel(cancel.id))
         }
