@@ -16,6 +16,13 @@ enum TimeInForce {
   TIME_IN_FORCE_POST_ONLY = 4;
 }
 
+enum MarketPhase {
+  MARKET_PHASE_UNSPECIFIED = 0;
+  MARKET_PHASE_OPEN = 1;
+  MARKET_PHASE_AUCTION = 2;
+  MARKET_PHASE_CLOSED = 3;
+}
+
 message PlaceLimit {
   uint64 id = 1;
   Side side = 2;
@@ -39,6 +46,16 @@ message Amend {
   optional uint64 qty = 4;
 }
 
+message SetMarketPhase {
+  string market_id = 1;
+  MarketPhase phase = 2;
+}
+
+message RunAuction {
+  string market_id = 1;
+  MarketPhase next_phase = 2;
+}
+
 message Cancel {
   uint64 id = 1;
   string market_id = 2;
@@ -51,6 +68,8 @@ message OrderCommand {
     PlaceMarket place_market = 2;
     Cancel cancel = 3;
     Amend amend = 4;
+    SetMarketPhase set_market_phase = 5;
+    RunAuction run_auction = 6;
   }
 }
 
@@ -110,6 +129,7 @@ message OrderBookSnapshot {
   repeated OrderSnapshot orders = 1;
   repeated LevelSnapshot bids = 2;
   repeated LevelSnapshot asks = 3;
+  MarketPhase phase = 4;
 }
 
 message MarketSnapshot {

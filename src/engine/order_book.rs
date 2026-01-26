@@ -12,6 +12,9 @@ pub enum Side { Bid, Ask }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeInForce { Gtc, Ioc, Fok, PostOnly }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketPhase { Open, Auction, Closed }
+
 #[derive(Debug, Clone, Copy)]
 pub struct Order {
     id: OrderId,
@@ -118,17 +121,24 @@ pub struct OrderBookSnapshot {
     pub orders: Vec<OrderSnapshot>,
     pub bids: Vec<LevelSnapshot>,
     pub asks: Vec<LevelSnapshot>,
+    pub phase: MarketPhase,
 }
 
 pub struct OrderBook {
     bids: BTreeMap<PriceTick, VecDeque<OrderId>>,
     asks: BTreeMap<PriceTick, VecDeque<OrderId>>,
     orders: HashMap<OrderId, Order>,
+    phase: MarketPhase,
 }
 
 impl OrderBook {
     pub fn new() -> Self {
-        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), orders: HashMap::new() }
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            orders: HashMap::new(),
+            phase: MarketPhase::Open,
+        }
     }
 
     #[inline]
@@ -194,7 +204,7 @@ impl OrderBook {
             })
             .collect();
 
-        OrderBookSnapshot { orders, bids, asks }
+        OrderBookSnapshot { orders, bids, asks, phase: self.phase }
     }
 
     pub fn from_snapshot(snapshot: OrderBookSnapshot) -> Self {
@@ -228,7 +238,7 @@ impl OrderBook {
             .map(|level| (level.price, VecDeque::from(level.order_ids)))
             .collect::<BTreeMap<_, _>>();
 
-        Self { bids, asks, orders }
+        Self { bids, asks, orders, phase: snapshot.phase }
     }
 
     // Minimal validation (crossing is OK)
@@ -288,6 +298,18 @@ impl OrderBook {
 
         let order = order.with_tif(tif);
 
+        if self.phase == MarketPhase::Closed {
+            events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
+            return events;
+        }
+
+        if self.phase == MarketPhase::Auction {
+            if matches!(tif, TimeInForce::Ioc | TimeInForce::Fok) {
+                events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
+                return events;
+            }
+        }
+
         if tif == TimeInForce::PostOnly && self.would_cross(&order) {
             events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
             return events;
@@ -301,8 +323,10 @@ impl OrderBook {
         // Insert into global store early so maker/taker updates are easy
         self.orders.insert(order.id, order);
 
-        // Match as taker
-        events.extend(self.match_order(order.id));
+        // Match as taker in continuous mode
+        if self.phase == MarketPhase::Open {
+            events.extend(self.match_order(order.id));
+        }
 
         // If still live with remaining qty, rest it
         let rest_qty = self.orders.get(&order.id).map(|o| (o.live, o.qty_remaining, o.price, o.side));
@@ -367,7 +391,7 @@ impl OrderBook {
             o.qty_remaining = qty;
         }
 
-        if price_changed && self.would_cross_at(side, price) {
+        if self.phase == MarketPhase::Open && price_changed && self.would_cross_at(side, price) {
             events.extend(self.match_order(id));
         }
 
@@ -391,6 +415,201 @@ impl OrderBook {
         }
 
         events
+    }
+
+    pub fn phase(&self) -> MarketPhase {
+        self.phase
+    }
+
+    pub fn set_phase(&mut self, phase: MarketPhase) {
+        self.phase = phase;
+    }
+
+    pub fn run_auction(&mut self, next_phase: MarketPhase) -> Vec<Event> {
+        let mut events = Vec::new();
+        if self.phase != MarketPhase::Auction {
+            return events;
+        }
+
+        let Some(clearing_price) = self.auction_clearing_price() else {
+            self.phase = next_phase;
+            return events;
+        };
+
+        events.extend(self.match_at_price(clearing_price));
+        self.phase = next_phase;
+        events
+    }
+
+    fn auction_clearing_price(&self) -> Option<PriceTick> {
+        let mut prices: Vec<PriceTick> = self
+            .bids
+            .keys()
+            .chain(self.asks.keys())
+            .copied()
+            .collect();
+        prices.sort_unstable();
+        prices.dedup();
+
+        let mut best: Option<(PriceTick, Qty, Qty)> = None;
+        for price in prices {
+            let bid_qty = self.sum_bids_at_or_above(price);
+            let ask_qty = self.sum_asks_at_or_below(price);
+            let matched = bid_qty.min(ask_qty);
+            if matched == 0 {
+                continue;
+            }
+            let imbalance = if bid_qty > ask_qty {
+                bid_qty - ask_qty
+            } else {
+                ask_qty - bid_qty
+            };
+            match best {
+                None => best = Some((price, matched, imbalance)),
+                Some((best_price, best_matched, best_imbalance)) => {
+                    if matched > best_matched
+                        || (matched == best_matched && imbalance < best_imbalance)
+                        || (matched == best_matched && imbalance == best_imbalance && price > best_price)
+                    {
+                        best = Some((price, matched, imbalance));
+                    }
+                }
+            }
+        }
+
+        best.map(|(price, _, _)| price)
+    }
+
+    fn sum_bids_at_or_above(&self, price: PriceTick) -> Qty {
+        let mut total: Qty = 0;
+        for (level_price, level) in self.bids.iter().rev() {
+            if *level_price < price {
+                break;
+            }
+            for id in level {
+                if let Some(o) = self.orders.get(id) {
+                    if o.live && o.qty_remaining > 0 {
+                        total += o.qty_remaining;
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    fn sum_asks_at_or_below(&self, price: PriceTick) -> Qty {
+        let mut total: Qty = 0;
+        for (level_price, level) in &self.asks {
+            if *level_price > price {
+                break;
+            }
+            for id in level {
+                if let Some(o) = self.orders.get(id) {
+                    if o.live && o.qty_remaining > 0 {
+                        total += o.qty_remaining;
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    fn match_at_price(&mut self, clearing_price: PriceTick) -> Vec<Event> {
+        let mut events = Vec::new();
+        let bids = self.auction_order_ids(Side::Bid, clearing_price);
+        let asks = self.auction_order_ids(Side::Ask, clearing_price);
+
+        let mut bid_idx = 0;
+        let mut ask_idx = 0;
+        while bid_idx < bids.len() && ask_idx < asks.len() {
+            let bid_id = bids[bid_idx];
+            let ask_id = asks[ask_idx];
+
+            let (bid_qty, ask_qty) = {
+                let bid = self.orders.get(&bid_id);
+                let ask = self.orders.get(&ask_id);
+                match (bid, ask) {
+                    (Some(b), Some(a)) if b.live && a.live && b.qty_remaining > 0 && a.qty_remaining > 0 => {
+                        (b.qty_remaining, a.qty_remaining)
+                    }
+                    _ => {
+                        if bid.is_none() || bid.map(|b| !b.live || b.qty_remaining == 0).unwrap_or(true) {
+                            bid_idx += 1;
+                        }
+                        if ask.is_none() || ask.map(|a| !a.live || a.qty_remaining == 0).unwrap_or(true) {
+                            ask_idx += 1;
+                        }
+                        continue;
+                    }
+                }
+            };
+
+            let fill_qty = bid_qty.min(ask_qty);
+
+            {
+                let bid = self.orders.get_mut(&bid_id).unwrap();
+                bid.qty_remaining -= fill_qty;
+                if bid.qty_remaining == 0 {
+                    bid.live = false;
+                }
+            }
+            {
+                let ask = self.orders.get_mut(&ask_id).unwrap();
+                ask.qty_remaining -= fill_qty;
+                if ask.qty_remaining == 0 {
+                    ask.live = false;
+                }
+            }
+
+            events.push(Event::Trade(TradeEvent {
+                taker_id: bid_id,
+                maker_id: ask_id,
+                price: clearing_price,
+                qty: fill_qty,
+            }));
+
+            if self.orders.get(&bid_id).map(|o| !o.live).unwrap_or(false) {
+                events.push(Event::Done(DoneEvent { order_id: bid_id, reason: DoneReason::Filled }));
+                let (price, side) = (self.orders.get(&bid_id).map(|o| o.price).unwrap_or(clearing_price), Side::Bid);
+                self.remove_from_level(bid_id, price, side);
+                bid_idx += 1;
+            }
+            if self.orders.get(&ask_id).map(|o| !o.live).unwrap_or(false) {
+                events.push(Event::Done(DoneEvent { order_id: ask_id, reason: DoneReason::Filled }));
+                let (price, side) = (self.orders.get(&ask_id).map(|o| o.price).unwrap_or(clearing_price), Side::Ask);
+                self.remove_from_level(ask_id, price, side);
+                ask_idx += 1;
+            }
+        }
+
+        events
+    }
+
+    fn auction_order_ids(&self, side: Side, clearing_price: PriceTick) -> Vec<OrderId> {
+        let mut ids = Vec::new();
+        match side {
+            Side::Bid => {
+                for (price, level) in self.bids.iter().rev() {
+                    if *price < clearing_price {
+                        break;
+                    }
+                    for id in level {
+                        ids.push(*id);
+                    }
+                }
+            }
+            Side::Ask => {
+                for (price, level) in &self.asks {
+                    if *price > clearing_price {
+                        break;
+                    }
+                    for id in level {
+                        ids.push(*id);
+                    }
+                }
+            }
+        }
+        ids
     }
 
     fn remove_from_level(&mut self, id: OrderId, price: PriceTick, side: Side) {

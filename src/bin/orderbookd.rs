@@ -11,8 +11,8 @@ use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
 use aws_sdk_s3::primitives::ByteStream;
 
 use hello_rust::engine::order_book::{
-    DoneEvent, DoneReason, Event, LevelSnapshot, Order, OrderBookSnapshot, OrderSnapshot, Side,
-    TimeInForce,
+    DoneEvent, DoneReason, Event, LevelSnapshot, MarketPhase, Order, OrderBookSnapshot,
+    OrderSnapshot, Side, TimeInForce,
 };
 use hello_rust::markets::{MarketSnapshot, Markets, MarketsSnapshot};
 use hello_rust::proto::orderbook as pb;
@@ -225,6 +225,21 @@ fn apply_command(markets: &mut Markets, command: pb::OrderCommand) -> Result<Vec
                 .book_mut(&amend.market_id)
                 .amend(amend.id, amend.price, amend.qty))
         }
+        Some(pb::order_command::Cmd::SetMarketPhase(set_phase)) => {
+            if set_phase.market_id.is_empty() {
+                return Ok(vec![]);
+            }
+            let phase = market_phase_from_proto(set_phase.phase);
+            markets.book_mut(&set_phase.market_id).set_phase(phase);
+            Ok(vec![])
+        }
+        Some(pb::order_command::Cmd::RunAuction(run)) => {
+            if run.market_id.is_empty() {
+                return Ok(vec![]);
+            }
+            let next_phase = market_phase_from_proto(run.next_phase);
+            Ok(markets.book_mut(&run.market_id).run_auction(next_phase))
+        }
         None => Err("missing command".to_string()),
     }
 }
@@ -269,6 +284,22 @@ fn time_in_force_from_snapshot(value: i32) -> TimeInForce {
         Ok(pb::TimeInForce::Ioc) => TimeInForce::Ioc,
         Ok(pb::TimeInForce::Fok) => TimeInForce::Fok,
         Ok(pb::TimeInForce::Gtc) | Ok(pb::TimeInForce::Unspecified) | Err(_) => TimeInForce::Gtc,
+    }
+}
+
+fn market_phase_from_proto(value: i32) -> MarketPhase {
+    match pb::MarketPhase::try_from(value) {
+        Ok(pb::MarketPhase::Auction) => MarketPhase::Auction,
+        Ok(pb::MarketPhase::Closed) => MarketPhase::Closed,
+        Ok(pb::MarketPhase::Open) | Ok(pb::MarketPhase::Unspecified) | Err(_) => MarketPhase::Open,
+    }
+}
+
+fn market_phase_to_proto(phase: MarketPhase) -> i32 {
+    match phase {
+        MarketPhase::Open => pb::MarketPhase::Open as i32,
+        MarketPhase::Auction => pb::MarketPhase::Auction as i32,
+        MarketPhase::Closed => pb::MarketPhase::Closed as i32,
     }
 }
 
@@ -518,6 +549,7 @@ fn order_book_snapshot_to_proto(snapshot: OrderBookSnapshot) -> pb::OrderBookSna
             .into_iter()
             .map(level_snapshot_to_proto)
             .collect(),
+        phase: market_phase_to_proto(snapshot.phase),
     }
 }
 
@@ -540,7 +572,12 @@ fn order_book_snapshot_from_proto(
         .map(level_snapshot_from_proto)
         .collect();
 
-    Ok(OrderBookSnapshot { orders, bids, asks })
+    Ok(OrderBookSnapshot {
+        orders,
+        bids,
+        asks,
+        phase: market_phase_from_proto(snapshot.phase),
+    })
 }
 
 fn order_snapshot_to_proto(snapshot: OrderSnapshot) -> pb::OrderSnapshot {

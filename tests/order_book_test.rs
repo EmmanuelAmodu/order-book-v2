@@ -338,4 +338,49 @@ mod tests {
         assert_eq!(ord.price(), 110);
         assert_eq!(ob.best_ask_price(), Some(110));
     }
+
+    #[test]
+    fn auction_defers_matching_and_clears_on_run() {
+        let mut ob = OrderBook::new();
+        ob.set_phase(MarketPhase::Auction);
+
+        let ev1 = ob.place_limit(o(1, Side::Bid, 110, 5));
+        let ev2 = ob.place_limit(o(2, Side::Ask, 100, 5));
+        assert!(trades(&ev1).is_empty());
+        assert!(trades(&ev2).is_empty());
+        assert!(has_ack(&ev1, 1));
+        assert!(has_ack(&ev2, 2));
+
+        let ev = ob.run_auction(MarketPhase::Open);
+        let ts = trades(&ev);
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].price, 110);
+        assert!(has_done(&ev, 1, DoneReason::Filled));
+        assert!(has_done(&ev, 2, DoneReason::Filled));
+        assert_eq!(ob.phase(), MarketPhase::Open);
+        assert!(ob.book_is_empty(Side::Bid));
+        assert!(ob.book_is_empty(Side::Ask));
+    }
+
+    #[test]
+    fn closed_rejects_new_orders() {
+        let mut ob = OrderBook::new();
+        ob.set_phase(MarketPhase::Closed);
+
+        let ev = ob.place_limit(o(1, Side::Bid, 100, 1));
+        assert!(has_done(&ev, 1, DoneReason::Rejected));
+        assert!(!has_ack(&ev, 1));
+        assert!(ob.order(1).is_none());
+    }
+
+    #[test]
+    fn auction_rejects_ioc() {
+        let mut ob = OrderBook::new();
+        ob.set_phase(MarketPhase::Auction);
+
+        let ev = ob.place_limit_with_tif(o(1, Side::Bid, 100, 1), TimeInForce::Ioc);
+        assert!(has_done(&ev, 1, DoneReason::Rejected));
+        assert!(!has_ack(&ev, 1));
+        assert!(ob.order(1).is_none());
+    }
 }
