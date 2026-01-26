@@ -12,6 +12,7 @@ use aws_sdk_s3::primitives::ByteStream;
 
 use hello_rust::engine::order_book::{
     DoneEvent, DoneReason, Event, LevelSnapshot, Order, OrderBookSnapshot, OrderSnapshot, Side,
+    TimeInForce,
 };
 use hello_rust::markets::{MarketSnapshot, Markets, MarketsSnapshot};
 use hello_rust::proto::orderbook as pb;
@@ -171,25 +172,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 fn apply_command(markets: &mut Markets, command: pb::OrderCommand) -> Result<Vec<Event>, String> {
     match command.cmd {
         Some(pb::order_command::Cmd::PlaceLimit(place)) => {
-            let side = match pb::Side::try_from(place.side) {
-                Ok(pb::Side::Bid) => Side::Bid,
-                Ok(pb::Side::Ask) => Side::Ask,
-                Ok(pb::Side::Unspecified) | Err(_) => {
-                    return Ok(vec![Event::Done(DoneEvent {
-                        order_id: place.id,
-                        reason: DoneReason::Rejected,
-                    })]);
-                }
+            let side = match side_from_proto(place.side) {
+                Some(side) => side,
+                None => return Ok(reject(place.id)),
             };
             if place.market_id.is_empty() {
-                return Ok(vec![Event::Done(DoneEvent {
-                    order_id: place.id,
-                    reason: DoneReason::Rejected,
-                })]);
+                return Ok(reject(place.id));
+            }
+            let tif = match time_in_force_from_proto(place.time_in_force) {
+                Ok(tif) => tif,
+                Err(_) => return Ok(reject(place.id)),
+            };
+            Ok(markets
+                .book_mut(&place.market_id)
+                .place_limit_with_tif(Order::new(place.id, side, place.price, place.qty), tif))
+        }
+        Some(pb::order_command::Cmd::PlaceMarket(place)) => {
+            let side = match side_from_proto(place.side) {
+                Some(side) => side,
+                None => return Ok(reject(place.id)),
+            };
+            if place.market_id.is_empty() {
+                return Ok(reject(place.id));
             }
             Ok(markets
                 .book_mut(&place.market_id)
-                .place_limit(Order::new(place.id, side, place.price, place.qty)))
+                .place_market(Order::market(place.id, side, place.qty)))
         }
         Some(pb::order_command::Cmd::Cancel(cancel)) => {
             if cancel.market_id.is_empty() {
@@ -198,9 +206,69 @@ fn apply_command(markets: &mut Markets, command: pb::OrderCommand) -> Result<Vec
                     reason: DoneReason::Rejected,
                 })]);
             }
-            Ok(markets.book_mut(&cancel.market_id).cancel(cancel.id))
+            if cancel.qty == 0 {
+                Ok(markets.book_mut(&cancel.market_id).cancel(cancel.id))
+            } else {
+                Ok(markets
+                    .book_mut(&cancel.market_id)
+                    .cancel_qty(cancel.id, cancel.qty))
+            }
+        }
+        Some(pb::order_command::Cmd::Amend(amend)) => {
+            if amend.market_id.is_empty() {
+                return Ok(reject(amend.id));
+            }
+            if amend.price.is_none() && amend.qty.is_none() {
+                return Ok(reject(amend.id));
+            }
+            Ok(markets
+                .book_mut(&amend.market_id)
+                .amend(amend.id, amend.price, amend.qty))
         }
         None => Err("missing command".to_string()),
+    }
+}
+
+fn reject(order_id: u64) -> Vec<Event> {
+    vec![Event::Done(DoneEvent {
+        order_id,
+        reason: DoneReason::Rejected,
+    })]
+}
+
+fn side_from_proto(side: i32) -> Option<Side> {
+    match pb::Side::try_from(side) {
+        Ok(pb::Side::Bid) => Some(Side::Bid),
+        Ok(pb::Side::Ask) => Some(Side::Ask),
+        Ok(pb::Side::Unspecified) | Err(_) => None,
+    }
+}
+
+fn time_in_force_from_proto(value: i32) -> Result<TimeInForce, String> {
+    match pb::TimeInForce::try_from(value) {
+        Ok(pb::TimeInForce::Unspecified) | Ok(pb::TimeInForce::Gtc) => Ok(TimeInForce::Gtc),
+        Ok(pb::TimeInForce::Ioc) => Ok(TimeInForce::Ioc),
+        Ok(pb::TimeInForce::Fok) => Ok(TimeInForce::Fok),
+        Ok(pb::TimeInForce::PostOnly) => Ok(TimeInForce::PostOnly),
+        Err(_) => Err("invalid time_in_force".to_string()),
+    }
+}
+
+fn time_in_force_to_proto(tif: TimeInForce) -> i32 {
+    match tif {
+        TimeInForce::Gtc => pb::TimeInForce::Gtc as i32,
+        TimeInForce::Ioc => pb::TimeInForce::Ioc as i32,
+        TimeInForce::Fok => pb::TimeInForce::Fok as i32,
+        TimeInForce::PostOnly => pb::TimeInForce::PostOnly as i32,
+    }
+}
+
+fn time_in_force_from_snapshot(value: i32) -> TimeInForce {
+    match pb::TimeInForce::try_from(value) {
+        Ok(pb::TimeInForce::PostOnly) => TimeInForce::PostOnly,
+        Ok(pb::TimeInForce::Ioc) => TimeInForce::Ioc,
+        Ok(pb::TimeInForce::Fok) => TimeInForce::Fok,
+        Ok(pb::TimeInForce::Gtc) | Ok(pb::TimeInForce::Unspecified) | Err(_) => TimeInForce::Gtc,
     }
 }
 
@@ -230,6 +298,13 @@ fn event_to_proto(event: Event) -> pb::Event {
         Event::Ack(a) => pb::Event {
             kind: Some(pb::event::Kind::Ack(pb::AckEvent {
                 order_id: a.order_id,
+            })),
+        },
+        Event::Update(u) => pb::Event {
+            kind: Some(pb::event::Kind::Update(pb::UpdateEvent {
+                order_id: u.order_id,
+                price: u.price,
+                qty_remaining: u.qty_remaining,
             })),
         },
     }
@@ -479,6 +554,7 @@ fn order_snapshot_to_proto(snapshot: OrderSnapshot) -> pb::OrderSnapshot {
         qty_remaining: snapshot.qty_remaining,
         side,
         live: snapshot.live,
+        time_in_force: time_in_force_to_proto(snapshot.time_in_force),
     }
 }
 
@@ -498,6 +574,7 @@ fn order_snapshot_from_proto(
         qty_remaining: snapshot.qty_remaining,
         side,
         live: snapshot.live,
+        time_in_force: time_in_force_from_snapshot(snapshot.time_in_force),
     })
 }
 

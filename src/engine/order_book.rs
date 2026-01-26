@@ -9,6 +9,9 @@ pub type Qty = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side { Bid, Ask }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeInForce { Gtc, Ioc, Fok, PostOnly }
+
 #[derive(Debug, Clone, Copy)]
 pub struct Order {
     id: OrderId,
@@ -16,11 +19,25 @@ pub struct Order {
     qty_remaining: Qty,
     side: Side,
     live: bool, // tombstone cancel
+    tif: TimeInForce,
 }
 
 impl Order {
     pub fn new(id: OrderId, side: Side, price: PriceTick, qty: Qty) -> Self {
-        Self { id, side, price, qty_remaining: qty, live: true }
+        Self { id, side, price, qty_remaining: qty, live: true, tif: TimeInForce::Gtc }
+    }
+
+    pub fn market(id: OrderId, side: Side, qty: Qty) -> Self {
+        let price = match side {
+            Side::Bid => PriceTick::MAX,
+            Side::Ask => 0,
+        };
+        Self { id, side, price, qty_remaining: qty, live: true, tif: TimeInForce::Ioc }
+    }
+
+    pub fn with_tif(mut self, tif: TimeInForce) -> Self {
+        self.tif = tif;
+        self
     }
 
     pub fn id(&self) -> OrderId {
@@ -42,6 +59,10 @@ impl Order {
     pub fn live(&self) -> bool {
         self.live
     }
+
+    pub fn time_in_force(&self) -> TimeInForce {
+        self.tif
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,10 +83,18 @@ pub struct DoneEvent { pub order_id: OrderId, pub reason: DoneReason }
 pub struct AckEvent { pub order_id: OrderId }
 
 #[derive(Debug, Clone, Copy)]
+pub struct UpdateEvent {
+    pub order_id: OrderId,
+    pub price: PriceTick,
+    pub qty_remaining: Qty,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum Event {
     Trade(TradeEvent),
     Done(DoneEvent),
     Ack(AckEvent),
+    Update(UpdateEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +104,7 @@ pub struct OrderSnapshot {
     pub qty_remaining: Qty,
     pub side: Side,
     pub live: bool,
+    pub time_in_force: TimeInForce,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +172,7 @@ impl OrderBook {
                 qty_remaining: o.qty_remaining,
                 side: o.side,
                 live: o.live,
+                time_in_force: o.tif,
             })
             .collect();
 
@@ -179,6 +210,7 @@ impl OrderBook {
                         qty_remaining: o.qty_remaining,
                         side: o.side,
                         live: o.live,
+                        tif: o.time_in_force,
                     },
                 )
             })
@@ -208,28 +240,40 @@ impl OrderBook {
     }
 
     pub fn cancel(&mut self, id: OrderId) -> Vec<Event> {
+        self.cancel_qty(id, 0)
+    }
+
+    pub fn cancel_qty(&mut self, id: OrderId, qty: Qty) -> Vec<Event> {
         let mut ev = Vec::new();
         if let Some(o) = self.orders.get_mut(&id) {
             if o.live && o.qty_remaining > 0 {
-                o.live = false;
-                let (price, side) = (o.price, o.side);
-                let book = match side {
-                    Side::Bid => &mut self.bids,
-                    Side::Ask => &mut self.asks,
-                };
-                if let Some(level) = book.get_mut(&price) {
-                    level.retain(|&order_id| order_id != id);
-                    if level.is_empty() {
-                        book.remove(&price);
-                    }
+                if qty == 0 || qty >= o.qty_remaining {
+                    o.live = false;
+                    let (price, side) = (o.price, o.side);
+                    self.remove_from_level(id, price, side);
+                    ev.push(Event::Done(DoneEvent { order_id: id, reason: DoneReason::Canceled }));
+                } else {
+                    o.qty_remaining -= qty;
+                    ev.push(Event::Update(UpdateEvent {
+                        order_id: id,
+                        price: o.price,
+                        qty_remaining: o.qty_remaining,
+                    }));
                 }
-                ev.push(Event::Done(DoneEvent { order_id: id, reason: DoneReason::Canceled }));
             }
         }
         ev
     }
 
     pub fn place_limit(&mut self, order: Order) -> Vec<Event> {
+        self.place_limit_with_tif(order, TimeInForce::Gtc)
+    }
+
+    pub fn place_market(&mut self, order: Order) -> Vec<Event> {
+        self.place_limit_with_tif(order, TimeInForce::Ioc)
+    }
+
+    pub fn place_limit_with_tif(&mut self, order: Order, tif: TimeInForce) -> Vec<Event> {
         let mut events = Vec::new();
 
         if self.orders.contains_key(&order.id) {
@@ -238,6 +282,18 @@ impl OrderBook {
         }
 
         if self.validate_order(&order).is_err() {
+            events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
+            return events;
+        }
+
+        let order = order.with_tif(tif);
+
+        if tif == TimeInForce::PostOnly && self.would_cross(&order) {
+            events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
+            return events;
+        }
+
+        if tif == TimeInForce::Fok && !self.can_fully_fill(&order) {
             events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Rejected }));
             return events;
         }
@@ -252,8 +308,17 @@ impl OrderBook {
         let rest_qty = self.orders.get(&order.id).map(|o| (o.live, o.qty_remaining, o.price, o.side));
         if let Some((live, qty_remaining, price, side)) = rest_qty {
             if live && qty_remaining > 0 {
-                let book = match side { Side::Bid => &mut self.bids, Side::Ask => &mut self.asks };
-                book.entry(price).or_insert_with(VecDeque::new).push_back(order.id);
+                match tif {
+                    TimeInForce::Gtc | TimeInForce::PostOnly => {
+                        let book = match side { Side::Bid => &mut self.bids, Side::Ask => &mut self.asks };
+                        book.entry(price).or_insert_with(VecDeque::new).push_back(order.id);
+                    }
+                    TimeInForce::Ioc | TimeInForce::Fok => {
+                        let order = self.orders.get_mut(&order.id).unwrap();
+                        order.live = false;
+                        events.push(Event::Done(DoneEvent { order_id: order.id, reason: DoneReason::Canceled }));
+                    }
+                }
             } else {
                 // fully filled inside match_order likely emitted Done(Filled)
             }
@@ -261,6 +326,144 @@ impl OrderBook {
 
         events.push(Event::Ack(AckEvent { order_id: order.id }));
         events
+    }
+
+    pub fn amend(
+        &mut self,
+        id: OrderId,
+        new_price: Option<PriceTick>,
+        new_qty: Option<Qty>,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        let (current_price, current_qty, side, tif) = match self.orders.get(&id) {
+            Some(o) if o.live && o.qty_remaining > 0 => (o.price, o.qty_remaining, o.side, o.tif),
+            _ => {
+                events.push(Event::Done(DoneEvent { order_id: id, reason: DoneReason::Rejected }));
+                return events;
+            }
+        };
+
+        let price = new_price.unwrap_or(current_price);
+        let qty = new_qty.unwrap_or(current_qty);
+
+        if qty == 0 {
+            return self.cancel(id);
+        }
+
+        if tif == TimeInForce::PostOnly && self.would_cross_at(side, price) {
+            events.push(Event::Done(DoneEvent { order_id: id, reason: DoneReason::Rejected }));
+            return events;
+        }
+
+        let price_changed = price != current_price;
+        let qty_increased = qty > current_qty;
+
+        if price_changed || qty_increased {
+            self.remove_from_level(id, current_price, side);
+        }
+
+        if let Some(o) = self.orders.get_mut(&id) {
+            o.price = price;
+            o.qty_remaining = qty;
+        }
+
+        if price_changed && self.would_cross_at(side, price) {
+            events.extend(self.match_order(id));
+        }
+
+        let rest = match self.orders.get(&id) {
+            Some(o) => o.live && o.qty_remaining > 0,
+            None => false,
+        };
+        if rest && (price_changed || qty_increased) {
+            let book = match side { Side::Bid => &mut self.bids, Side::Ask => &mut self.asks };
+            book.entry(price).or_insert_with(VecDeque::new).push_back(id);
+        }
+
+        if rest && (price_changed || qty != current_qty) {
+            if let Some(o) = self.orders.get(&id) {
+                events.push(Event::Update(UpdateEvent {
+                    order_id: id,
+                    price: o.price,
+                    qty_remaining: o.qty_remaining,
+                }));
+            }
+        }
+
+        events
+    }
+
+    fn remove_from_level(&mut self, id: OrderId, price: PriceTick, side: Side) {
+        let book = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        if let Some(level) = book.get_mut(&price) {
+            level.retain(|&order_id| order_id != id);
+            if level.is_empty() {
+                book.remove(&price);
+            }
+        }
+    }
+
+    fn would_cross(&self, order: &Order) -> bool {
+        self.would_cross_at(order.side, order.price)
+    }
+
+    fn would_cross_at(&self, side: Side, price: PriceTick) -> bool {
+        let best_opp = match side {
+            Side::Bid => self.best_ask_price(),
+            Side::Ask => self.best_bid_price(),
+        };
+        let opp_price = match best_opp {
+            Some(price) => price,
+            None => return false,
+        };
+        match side {
+            Side::Bid => opp_price <= price,
+            Side::Ask => opp_price >= price,
+        }
+    }
+
+    fn can_fully_fill(&self, order: &Order) -> bool {
+        let mut remaining = order.qty_remaining;
+        match order.side {
+            Side::Bid => {
+                for (price, level) in &self.asks {
+                    if *price > order.price {
+                        break;
+                    }
+                    for id in level {
+                        if let Some(o) = self.orders.get(id) {
+                            if o.live && o.qty_remaining > 0 {
+                                if o.qty_remaining >= remaining {
+                                    return true;
+                                }
+                                remaining -= o.qty_remaining;
+                            }
+                        }
+                    }
+                }
+            }
+            Side::Ask => {
+                for (price, level) in self.bids.iter().rev() {
+                    if *price < order.price {
+                        break;
+                    }
+                    for id in level {
+                        if let Some(o) = self.orders.get(id) {
+                            if o.live && o.qty_remaining > 0 {
+                                if o.qty_remaining >= remaining {
+                                    return true;
+                                }
+                                remaining -= o.qty_remaining;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn match_order(&mut self, taker_id: OrderId) -> Vec<Event> {

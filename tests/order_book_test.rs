@@ -18,6 +18,12 @@ mod tests {
         }).collect()
     }
 
+    fn updates(events: &[Event]) -> Vec<UpdateEvent> {
+        events.iter().filter_map(|e| {
+            if let Event::Update(u) = *e { Some(u) } else { None }
+        }).collect()
+    }
+
     fn has_done(events: &[Event], id: OrderId, reason: DoneReason) -> bool {
         done(events).into_iter().any(|d| d.order_id == id && d.reason == reason)
     }
@@ -219,5 +225,117 @@ mod tests {
         assert!(!ob.level_exists(Side::Ask, 100));
         assert_eq!(ob.best_ask_price(), None);
         assert!(ob.book_is_empty(Side::Ask));
+    }
+
+    #[test]
+    fn ioc_cancels_remainder_without_resting() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o(1, Side::Ask, 100, 2));
+
+        let ev = ob.place_limit_with_tif(o(2, Side::Bid, 100, 5), TimeInForce::Ioc);
+        let ts = trades(&ev);
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].qty, 2);
+
+        assert!(has_done(&ev, 2, DoneReason::Canceled));
+        assert!(has_ack(&ev, 2));
+        assert!(ob.best_bid_price().is_none());
+        assert!(ob.book_is_empty(Side::Bid));
+    }
+
+    #[test]
+    fn fok_rejects_when_not_fully_fillable() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o(1, Side::Ask, 100, 2));
+
+        let ev = ob.place_limit_with_tif(o(2, Side::Bid, 100, 3), TimeInForce::Fok);
+        assert!(trades(&ev).is_empty());
+        assert!(has_done(&ev, 2, DoneReason::Rejected));
+        assert!(!has_ack(&ev, 2));
+        assert!(ob.order(2).is_none());
+    }
+
+    #[test]
+    fn post_only_rejects_crossing_and_rests_when_not_crossing() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o(1, Side::Ask, 100, 2));
+
+        let ev = ob.place_limit_with_tif(o(2, Side::Bid, 110, 1), TimeInForce::PostOnly);
+        assert!(trades(&ev).is_empty());
+        assert!(has_done(&ev, 2, DoneReason::Rejected));
+        assert!(!has_ack(&ev, 2));
+        assert!(ob.order(2).is_none());
+
+        let ev = ob.place_limit_with_tif(o(3, Side::Bid, 90, 1), TimeInForce::PostOnly);
+        assert!(has_ack(&ev, 3));
+        assert_eq!(ob.best_bid_price(), Some(90));
+        assert_eq!(ob.level_front(Side::Bid, 90), Some(3));
+    }
+
+    #[test]
+    fn market_order_sweeps_and_cancels_remainder() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o(1, Side::Ask, 100, 2));
+        ob.place_limit(o(2, Side::Ask, 101, 2));
+
+        let ev = ob.place_market(Order::market(9, Side::Bid, 5));
+        let ts = trades(&ev);
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].qty, 2);
+        assert_eq!(ts[1].qty, 2);
+        assert!(has_done(&ev, 9, DoneReason::Canceled));
+        assert!(has_ack(&ev, 9));
+        assert!(ob.book_is_empty(Side::Ask));
+        assert!(ob.book_is_empty(Side::Bid));
+    }
+
+    #[test]
+    fn partial_cancel_emits_update_and_reduces_qty() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o(1, Side::Ask, 100, 5));
+        let ev = ob.cancel_qty(1, 2);
+        let us = updates(&ev);
+        assert_eq!(us.len(), 1);
+        assert_eq!(us[0].order_id, 1);
+        assert_eq!(us[0].qty_remaining, 3);
+        assert_eq!(us[0].price, 100);
+
+        let ord = ob.order(1).unwrap();
+        assert!(ord.live());
+        assert_eq!(ord.qty_remaining(), 3);
+        assert_eq!(ob.best_ask_price(), Some(100));
+    }
+
+    #[test]
+    fn amend_moves_price_and_emits_update() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o(1, Side::Ask, 100, 5));
+        let ev = ob.amend(1, Some(105), None);
+        let us = updates(&ev);
+        assert_eq!(us.len(), 1);
+        assert_eq!(us[0].price, 105);
+        assert_eq!(ob.best_ask_price(), Some(105));
+        assert!(!ob.level_exists(Side::Ask, 100));
+    }
+
+    #[test]
+    fn amend_rejects_crossing_for_post_only() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit_with_tif(o(1, Side::Ask, 110, 5), TimeInForce::PostOnly);
+        ob.place_limit(o(2, Side::Bid, 100, 5));
+
+        let ev = ob.amend(1, Some(90), None);
+        assert!(has_done(&ev, 1, DoneReason::Rejected));
+
+        let ord = ob.order(1).unwrap();
+        assert_eq!(ord.price(), 110);
+        assert_eq!(ob.best_ask_price(), Some(110));
     }
 }

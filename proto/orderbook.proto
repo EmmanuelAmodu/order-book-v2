@@ -8,23 +8,49 @@ enum Side {
   SIDE_ASK = 2;
 }
 
+enum TimeInForce {
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  TIME_IN_FORCE_GTC = 1;
+  TIME_IN_FORCE_IOC = 2;
+  TIME_IN_FORCE_FOK = 3;
+  TIME_IN_FORCE_POST_ONLY = 4;
+}
+
 message PlaceLimit {
   uint64 id = 1;
   Side side = 2;
   uint32 price = 3;
   uint64 qty = 4;
   string market_id = 5;
+  TimeInForce time_in_force = 6;
+}
+
+message PlaceMarket {
+  uint64 id = 1;
+  Side side = 2;
+  uint64 qty = 3;
+  string market_id = 4;
+}
+
+message Amend {
+  uint64 id = 1;
+  string market_id = 2;
+  optional uint32 price = 3;
+  optional uint64 qty = 4;
 }
 
 message Cancel {
   uint64 id = 1;
   string market_id = 2;
+  uint64 qty = 3;
 }
 
 message OrderCommand {
   oneof cmd {
     PlaceLimit place_limit = 1;
-    Cancel cancel = 2;
+    PlaceMarket place_market = 2;
+    Cancel cancel = 3;
+    Amend amend = 4;
   }
 }
 
@@ -51,11 +77,18 @@ message AckEvent {
   uint64 order_id = 1;
 }
 
+message UpdateEvent {
+  uint64 order_id = 1;
+  uint32 price = 2;
+  uint64 qty_remaining = 3;
+}
+
 message Event {
   oneof kind {
     TradeEvent trade = 1;
     DoneEvent done = 2;
     AckEvent ack = 3;
+    UpdateEvent update = 4;
   }
 }
 
@@ -65,6 +98,7 @@ message OrderSnapshot {
   uint64 qty_remaining = 3;
   Side side = 4;
   bool live = 5;
+  TimeInForce time_in_force = 6;
 }
 
 message LevelSnapshot {
