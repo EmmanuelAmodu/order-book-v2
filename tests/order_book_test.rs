@@ -205,4 +205,19 @@ mod tests {
         assert!(ob.book_is_empty(Side::Bid));
         assert!(ob.book_is_empty(Side::Ask));
     }
+
+    #[test]
+    fn cancel_removes_from_level_and_clears_best_price() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o(1, Side::Ask, 100, 5));
+        assert_eq!(ob.best_ask_price(), Some(100));
+
+        let ev = ob.cancel(1);
+        assert!(has_done(&ev, 1, DoneReason::Canceled));
+
+        assert!(!ob.level_exists(Side::Ask, 100));
+        assert_eq!(ob.best_ask_price(), None);
+        assert!(ob.book_is_empty(Side::Ask));
+    }
 }

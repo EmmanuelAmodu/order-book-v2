@@ -212,6 +212,17 @@ impl OrderBook {
         if let Some(o) = self.orders.get_mut(&id) {
             if o.live && o.qty_remaining > 0 {
                 o.live = false;
+                let (price, side) = (o.price, o.side);
+                let book = match side {
+                    Side::Bid => &mut self.bids,
+                    Side::Ask => &mut self.asks,
+                };
+                if let Some(level) = book.get_mut(&price) {
+                    level.retain(|&order_id| order_id != id);
+                    if level.is_empty() {
+                        book.remove(&price);
+                    }
+                }
                 ev.push(Event::Done(DoneEvent { order_id: id, reason: DoneReason::Canceled }));
             }
         }
