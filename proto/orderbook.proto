@@ -58,3 +58,32 @@ message Event {
     AckEvent ack = 3;
   }
 }
+
+message OrderSnapshot {
+  uint64 id = 1;
+  uint32 price = 2;
+  uint64 qty_remaining = 3;
+  Side side = 4;
+  bool live = 5;
+}
+
+message LevelSnapshot {
+  uint32 price = 1;
+  repeated uint64 order_ids = 2;
+}
+
+message OrderBookSnapshot {
+  repeated OrderSnapshot orders = 1;
+  repeated LevelSnapshot bids = 2;
+  repeated LevelSnapshot asks = 3;
+}
+
+message MarketSnapshot {
+  string market_id = 1;
+  OrderBookSnapshot book = 2;
+}
+
+message StateSnapshot {
+  uint64 last_sequence = 1;
+  repeated MarketSnapshot markets = 2;
+}

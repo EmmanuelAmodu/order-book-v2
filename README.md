@@ -12,6 +12,20 @@ This service consumes protobuf-encoded order commands from NATS JetStream, route
 
 The stream is created (if missing) with subjects `[orders, events]`.
 
+## Snapshot + Order Tape
+
+- Order tape: the JetStream `orders` subject is the append-only tape. The service can replay orders from any snapshot by starting at the snapshot sequence.
+- Snapshots are protobuf-encoded `StateSnapshot` messages stored in S3 at:
+  - `s3://$SNAPSHOT_BUCKET/$SNAPSHOT_PREFIX/$JETSTREAM_STREAM/seq_{sequence}.bin`
+- On shutdown (SIGINT/SIGTERM), the service writes a snapshot.
+- On startup, it loads the latest snapshot by default or a specific one if `SNAPSHOT_KEY` is set.
+
+Environment variables:
+
+- `SNAPSHOT_BUCKET` (required to enable snapshots)
+- `SNAPSHOT_PREFIX` (default: `snapshots`)
+- `SNAPSHOT_KEY` (optional: load a specific snapshot key)
+
 ## Message Schema (Protobuf)
 
 Payloads are protobuf messages defined in `proto/orderbook.proto`:
@@ -75,6 +89,35 @@ message Event {
     DoneEvent done = 2;
     AckEvent ack = 3;
   }
+}
+
+message OrderSnapshot {
+  uint64 id = 1;
+  uint32 price = 2;
+  uint64 qty_remaining = 3;
+  Side side = 4;
+  bool live = 5;
+}
+
+message LevelSnapshot {
+  uint32 price = 1;
+  repeated uint64 order_ids = 2;
+}
+
+message OrderBookSnapshot {
+  repeated OrderSnapshot orders = 1;
+  repeated LevelSnapshot bids = 2;
+  repeated LevelSnapshot asks = 3;
+}
+
+message MarketSnapshot {
+  string market_id = 1;
+  OrderBookSnapshot book = 2;
+}
+
+message StateSnapshot {
+  uint64 last_sequence = 1;
+  repeated MarketSnapshot markets = 2;
 }
 ```
 

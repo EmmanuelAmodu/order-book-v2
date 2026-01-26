@@ -6,9 +6,14 @@ edition = "2024"
 [dependencies]
 ordered-float = "5.1.0"
 async-nats = "0.38.0"
-tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "signal"] }
 futures = "0.3.31"
 prost = "0.12.6"
+aws-config = "=1.5.5"
+aws-sdk-s3 = "=1.46.0"
+aws-sdk-sso = "=1.37.0"
+aws-sdk-ssooidc = "=1.38.0"
+aws-sdk-sts = "=1.37.0"
 
 [build-dependencies]
 prost-build = "0.12.6"

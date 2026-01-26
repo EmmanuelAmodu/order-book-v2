@@ -68,6 +68,28 @@ pub enum Event {
     Ack(AckEvent),
 }
 
+#[derive(Debug, Clone)]
+pub struct OrderSnapshot {
+    pub id: OrderId,
+    pub price: PriceTick,
+    pub qty_remaining: Qty,
+    pub side: Side,
+    pub live: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LevelSnapshot {
+    pub price: PriceTick,
+    pub order_ids: Vec<OrderId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderBookSnapshot {
+    pub orders: Vec<OrderSnapshot>,
+    pub bids: Vec<LevelSnapshot>,
+    pub asks: Vec<LevelSnapshot>,
+}
+
 pub struct OrderBook {
     bids: BTreeMap<PriceTick, VecDeque<OrderId>>,
     asks: BTreeMap<PriceTick, VecDeque<OrderId>>,
@@ -108,6 +130,73 @@ impl OrderBook {
             Side::Bid => self.bids.is_empty(),
             Side::Ask => self.asks.is_empty(),
         }
+    }
+
+    pub fn snapshot(&self) -> OrderBookSnapshot {
+        let orders = self
+            .orders
+            .values()
+            .map(|o| OrderSnapshot {
+                id: o.id,
+                price: o.price,
+                qty_remaining: o.qty_remaining,
+                side: o.side,
+                live: o.live,
+            })
+            .collect();
+
+        let bids = self
+            .bids
+            .iter()
+            .map(|(price, level)| LevelSnapshot {
+                price: *price,
+                order_ids: level.iter().copied().collect(),
+            })
+            .collect();
+
+        let asks = self
+            .asks
+            .iter()
+            .map(|(price, level)| LevelSnapshot {
+                price: *price,
+                order_ids: level.iter().copied().collect(),
+            })
+            .collect();
+
+        OrderBookSnapshot { orders, bids, asks }
+    }
+
+    pub fn from_snapshot(snapshot: OrderBookSnapshot) -> Self {
+        let orders = snapshot
+            .orders
+            .into_iter()
+            .map(|o| {
+                (
+                    o.id,
+                    Order {
+                        id: o.id,
+                        price: o.price,
+                        qty_remaining: o.qty_remaining,
+                        side: o.side,
+                        live: o.live,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let bids = snapshot
+            .bids
+            .into_iter()
+            .map(|level| (level.price, VecDeque::from(level.order_ids)))
+            .collect::<BTreeMap<_, _>>();
+
+        let asks = snapshot
+            .asks
+            .into_iter()
+            .map(|level| (level.price, VecDeque::from(level.order_ids)))
+            .collect::<BTreeMap<_, _>>();
+
+        Self { bids, asks, orders }
     }
 
     // Minimal validation (crossing is OK)
