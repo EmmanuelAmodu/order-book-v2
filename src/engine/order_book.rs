@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque, HashMap};
 
 pub const TICK_SIZE: f64 = 0.000001;
+pub const ENGINE_VERSION: u32 = 1;
 
 pub type OrderId = u64;
 pub type PriceTick = u32; // integer ticks

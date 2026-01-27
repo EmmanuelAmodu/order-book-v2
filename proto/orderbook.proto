@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package orderbook;
 
+option go_package = "github.com/EmmanuelAmodu/clob-gateway/internal/pb/orderbook;orderbook";
+
 enum Side {
   SIDE_UNSPECIFIED = 0;
   SIDE_BID = 1;
@@ -143,4 +145,5 @@ message MarketSnapshot {
 message StateSnapshot {
   uint64 last_sequence = 1;
   repeated MarketSnapshot markets = 2;
+  uint32 engine_version = 3;
 }

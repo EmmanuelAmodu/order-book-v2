@@ -12,7 +12,7 @@ use aws_sdk_s3::primitives::ByteStream;
 
 use hello_rust::engine::order_book::{
     DoneEvent, DoneReason, Event, LevelSnapshot, MarketPhase, Order, OrderBookSnapshot,
-    OrderSnapshot, Side, TimeInForce,
+    OrderSnapshot, Side, TimeInForce, ENGINE_VERSION,
 };
 use hello_rust::markets::{MarketSnapshot, Markets, MarketsSnapshot};
 use hello_rust::proto::orderbook as pb;
@@ -499,10 +499,18 @@ fn state_to_proto(state: &AppState) -> pb::StateSnapshot {
             .into_iter()
             .map(market_snapshot_to_proto)
             .collect(),
+        engine_version: ENGINE_VERSION,
     }
 }
 
 fn state_from_proto(snapshot: pb::StateSnapshot) -> Result<AppState, Box<dyn Error + Send + Sync>> {
+    if snapshot.engine_version != 0 && snapshot.engine_version != ENGINE_VERSION {
+        return Err(format!(
+            "snapshot engine version {} does not match engine {}",
+            snapshot.engine_version, ENGINE_VERSION
+        )
+        .into());
+    }
     let last_sequence = snapshot.last_sequence;
     let markets = snapshot
         .markets
