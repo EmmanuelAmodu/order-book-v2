@@ -5,6 +5,7 @@ pub const TICK_SIZE: f64 = 0.000001;
 pub type OrderId = u64;
 pub type PriceTick = u32; // integer ticks
 pub type Qty = u64;
+pub type OwnerId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side { Bid, Ask }
@@ -23,19 +24,36 @@ pub struct Order {
     side: Side,
     live: bool, // tombstone cancel
     tif: TimeInForce,
+    owner_id: OwnerId,
 }
 
 impl Order {
-    pub fn new(id: OrderId, side: Side, price: PriceTick, qty: Qty) -> Self {
-        Self { id, side, price, qty_remaining: qty, live: true, tif: TimeInForce::Gtc }
+    pub fn new(id: OrderId, owner_id: OwnerId, side: Side, price: PriceTick, qty: Qty) -> Self {
+        Self {
+            id,
+            side,
+            price,
+            qty_remaining: qty,
+            live: true,
+            tif: TimeInForce::Gtc,
+            owner_id,
+        }
     }
 
-    pub fn market(id: OrderId, side: Side, qty: Qty) -> Self {
+    pub fn market(id: OrderId, owner_id: OwnerId, side: Side, qty: Qty) -> Self {
         let price = match side {
             Side::Bid => PriceTick::MAX,
             Side::Ask => 0,
         };
-        Self { id, side, price, qty_remaining: qty, live: true, tif: TimeInForce::Ioc }
+        Self {
+            id,
+            side,
+            price,
+            qty_remaining: qty,
+            live: true,
+            tif: TimeInForce::Ioc,
+            owner_id,
+        }
     }
 
     pub fn with_tif(mut self, tif: TimeInForce) -> Self {
@@ -66,6 +84,14 @@ impl Order {
     pub fn time_in_force(&self) -> TimeInForce {
         self.tif
     }
+
+    pub fn owner_id(&self) -> OwnerId {
+        self.owner_id
+    }
+}
+
+fn self_trade(owner_a: OwnerId, owner_b: OwnerId) -> bool {
+    owner_a != 0 && owner_b != 0 && owner_a == owner_b
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +134,7 @@ pub struct OrderSnapshot {
     pub side: Side,
     pub live: bool,
     pub time_in_force: TimeInForce,
+    pub owner_id: OwnerId,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +210,7 @@ impl OrderBook {
                 side: o.side,
                 live: o.live,
                 time_in_force: o.tif,
+                owner_id: o.owner_id,
             })
             .collect();
 
@@ -221,6 +249,7 @@ impl OrderBook {
                         side: o.side,
                         live: o.live,
                         tif: o.time_in_force,
+                        owner_id: o.owner_id,
                     },
                 )
             })
@@ -544,6 +573,22 @@ impl OrderBook {
                 }
             };
 
+            let (bid_owner, ask_owner) = {
+                let bid = self.orders.get(&bid_id);
+                let ask = self.orders.get(&ask_id);
+                (bid.map(|o| o.owner_id).unwrap_or(0), ask.map(|o| o.owner_id).unwrap_or(0))
+            };
+            if self_trade(bid_owner, ask_owner) {
+                if let Some(bid) = self.orders.get_mut(&bid_id) {
+                    bid.live = false;
+                }
+                events.push(Event::Done(DoneEvent { order_id: bid_id, reason: DoneReason::Canceled }));
+                let price = self.orders.get(&bid_id).map(|o| o.price).unwrap_or(clearing_price);
+                self.remove_from_level(bid_id, price, Side::Bid);
+                bid_idx += 1;
+                continue;
+            }
+
             let fill_qty = bid_qty.min(ask_qty);
 
             {
@@ -654,7 +699,7 @@ impl OrderBook {
                     }
                     for id in level {
                         if let Some(o) = self.orders.get(id) {
-                            if o.live && o.qty_remaining > 0 {
+                            if o.live && o.qty_remaining > 0 && !self_trade(order.owner_id, o.owner_id) {
                                 if o.qty_remaining >= remaining {
                                     return true;
                                 }
@@ -671,7 +716,7 @@ impl OrderBook {
                     }
                     for id in level {
                         if let Some(o) = self.orders.get(id) {
-                            if o.live && o.qty_remaining > 0 {
+                            if o.live && o.qty_remaining > 0 && !self_trade(order.owner_id, o.owner_id) {
                                 if o.qty_remaining >= remaining {
                                     return true;
                                 }
@@ -690,8 +735,8 @@ impl OrderBook {
 
         loop {
             // Pull taker snapshot (avoid long borrows)
-            let (taker_side, taker_price, taker_live, taker_qty) = match self.orders.get(&taker_id) {
-                Some(o) => (o.side, o.price, o.live, o.qty_remaining),
+            let (taker_owner, taker_side, taker_price, taker_live, taker_qty) = match self.orders.get(&taker_id) {
+                Some(o) => (o.owner_id, o.side, o.price, o.live, o.qty_remaining),
                 None => break,
             };
             if !taker_live || taker_qty == 0 { break; }
@@ -742,6 +787,15 @@ impl OrderBook {
             }
 
             let maker_id = maker_id_opt.unwrap();
+
+            let maker_owner = self.orders.get(&maker_id).map(|o| o.owner_id).unwrap_or(0);
+            if self_trade(taker_owner, maker_owner) {
+                if let Some(taker) = self.orders.get_mut(&taker_id) {
+                    taker.live = false;
+                }
+                events.push(Event::Done(DoneEvent { order_id: taker_id, reason: DoneReason::Canceled }));
+                break;
+            }
 
             // Now do the actual fill
             let (maker_price, fill_qty) = {

@@ -185,7 +185,10 @@ fn apply_command(markets: &mut Markets, command: pb::OrderCommand) -> Result<Vec
             };
             Ok(markets
                 .book_mut(&place.market_id)
-                .place_limit_with_tif(Order::new(place.id, side, place.price, place.qty), tif))
+                .place_limit_with_tif(
+                    Order::new(place.id, place.owner_id, side, place.price, place.qty),
+                    tif,
+                ))
         }
         Some(pb::order_command::Cmd::PlaceMarket(place)) => {
             let side = match side_from_proto(place.side) {
@@ -197,7 +200,7 @@ fn apply_command(markets: &mut Markets, command: pb::OrderCommand) -> Result<Vec
             }
             Ok(markets
                 .book_mut(&place.market_id)
-                .place_market(Order::market(place.id, side, place.qty)))
+                .place_market(Order::market(place.id, place.owner_id, side, place.qty)))
         }
         Some(pb::order_command::Cmd::Cancel(cancel)) => {
             if cancel.market_id.is_empty() {
@@ -592,6 +595,7 @@ fn order_snapshot_to_proto(snapshot: OrderSnapshot) -> pb::OrderSnapshot {
         side,
         live: snapshot.live,
         time_in_force: time_in_force_to_proto(snapshot.time_in_force),
+        owner_id: snapshot.owner_id,
     }
 }
 
@@ -612,6 +616,7 @@ fn order_snapshot_from_proto(
         side,
         live: snapshot.live,
         time_in_force: time_in_force_from_snapshot(snapshot.time_in_force),
+        owner_id: snapshot.owner_id,
     })
 }
 

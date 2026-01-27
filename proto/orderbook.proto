@@ -30,6 +30,7 @@ message PlaceLimit {
   uint64 qty = 4;
   string market_id = 5;
   TimeInForce time_in_force = 6;
+  uint64 owner_id = 7;
 }
 
 message PlaceMarket {
@@ -37,6 +38,7 @@ message PlaceMarket {
   Side side = 2;
   uint64 qty = 3;
   string market_id = 4;
+  uint64 owner_id = 5;
 }
 
 message Amend {
@@ -118,6 +120,7 @@ message OrderSnapshot {
   Side side = 4;
   bool live = 5;
   TimeInForce time_in_force = 6;
+  uint64 owner_id = 7;
 }
 
 message LevelSnapshot {

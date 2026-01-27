@@ -3,7 +3,11 @@ mod tests {
     use hello_rust::engine::order_book::*;
 
     fn o(id: OrderId, side: Side, price: PriceTick, qty: Qty) -> Order {
-        Order::new(id, side, price, qty)
+        Order::new(id, id, side, price, qty)
+    }
+
+    fn o_owner(id: OrderId, owner_id: OwnerId, side: Side, price: PriceTick, qty: Qty) -> Order {
+        Order::new(id, owner_id, side, price, qty)
     }
 
     fn trades(events: &[Event]) -> Vec<TradeEvent> {
@@ -204,7 +208,7 @@ mod tests {
     fn reject_zero_qty_input() {
         let mut ob = OrderBook::new();
 
-        let ev = ob.place_limit(Order::new(2, Side::Bid, 90, 0));
+        let ev = ob.place_limit(Order::new(2, 2, Side::Bid, 90, 0));
         assert!(has_done(&ev, 2, DoneReason::Rejected));
         assert!(!has_ack(&ev, 2));
         assert!(ob.order(2).is_none());
@@ -282,7 +286,7 @@ mod tests {
         ob.place_limit(o(1, Side::Ask, 100, 2));
         ob.place_limit(o(2, Side::Ask, 101, 2));
 
-        let ev = ob.place_market(Order::market(9, Side::Bid, 5));
+        let ev = ob.place_market(Order::market(9, 99, Side::Bid, 5));
         let ts = trades(&ev);
         assert_eq!(ts.len(), 2);
         assert_eq!(ts[0].qty, 2);
@@ -382,5 +386,21 @@ mod tests {
         assert!(has_done(&ev, 1, DoneReason::Rejected));
         assert!(!has_ack(&ev, 1));
         assert!(ob.order(1).is_none());
+    }
+
+    #[test]
+    fn self_trade_is_prevented() {
+        let mut ob = OrderBook::new();
+
+        ob.place_limit(o_owner(1, 42, Side::Ask, 100, 5));
+        let ev = ob.place_limit(o_owner(2, 42, Side::Bid, 100, 5));
+        assert!(trades(&ev).is_empty());
+        assert!(has_done(&ev, 2, DoneReason::Canceled));
+
+        let maker = ob.order(1).unwrap();
+        assert!(maker.live());
+        assert_eq!(maker.qty_remaining(), 5);
+        assert_eq!(ob.best_ask_price(), Some(100));
+        assert!(ob.book_is_empty(Side::Bid));
     }
 }
